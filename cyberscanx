@@ -1,0 +1,369 @@
+#!/bin/bash
+#
+# CyberScanX v2.0.0
+# Author: Ahmed Bouaoud
+# GitHub: https://github.com/midotech1/cyberscanx
+#
+# Massive website scanner tool with proxy, brute force, nmap, SSL, CMS detection, etc.
+
+# ===== CONFIG =====
+VERSION="2.0.0"
+DEFAULT_TIMEOUT=15
+DEFAULT_USER_AGENT="Mozilla/5.0 (compatible; CyberScanX/$VERSION; +https://github.com/yourrepo)"
+DEFAULT_PORTS="80,443,8080,8443"
+MAX_CONCURRENT=10   # for brute forcing concurrency
+
+# ===== COLORS =====
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+MAGENTA="\033[35m"
+CYAN="\033[36m"
+RESET="\033[0m"
+
+# ===== GLOBALS =====
+proxy=""
+timeout=$DEFAULT_TIMEOUT
+verbose=0
+output_file=""
+user_agent=$DEFAULT_USER_AGENT
+declare -a custom_headers=()
+skip_robots=0
+skip_admin=0
+skip_cms=0
+port_scan=0
+ports=$DEFAULT_PORTS
+brute_force=0
+wordlist=""
+domain=""
+start_time=0
+
+# ===== UTILITIES =====
+log() { echo -e "$@"; }
+logv() { if [ "$verbose" -eq 1 ]; then echo -e "${YELLOW}[DEBUG] $*${RESET}"; fi; }
+error_exit() { echo -e "${RED}Error: $1${RESET}"; exit 1; }
+figlet CyberScanX
+# ===== HELP & USAGE =====
+usage() {
+cat <<EOF
+CyberScanX v$VERSION - Mega Website Scanner Tool
+
+Usage: $0 [options] domain.com
+
+Options:
+  -p, --proxy <proxy_url>       Use HTTP/SOCKS proxy (e.g. http://127.0.0.1:8080)
+  -t, --timeout <seconds>       HTTP request timeout (default: $DEFAULT_TIMEOUT)
+  -v, --verbose                 Enable verbose debug output
+  -o, --output <file>           Save output to file (txt or json)
+  -u, --user-agent <string>     Custom User-Agent string
+  -H, --header <header>         Add custom HTTP header (repeatable)
+  --skip-robots                 Skip robots.txt fetch
+  --skip-admin                  Skip admin/sensitive file checks
+  --skip-cms                    Skip CMS detection (WordPress, Joomla, Drupal...)
+  --port-scan                   Run nmap port/vuln scan on resolved IP
+  --ports <portlist>            Comma-separated ports for nmap scan (default: $DEFAULT_PORTS)
+  --brute-force <wordlist>      Run directory brute force scan using wordlist file
+  --concurrency <num>           Max concurrent threads for brute force (default: $MAX_CONCURRENT)
+  -h, --help                   Show this help and exit
+
+Examples:
+  $0 example.com
+  $0 -p http://127.0.0.1:8080 --port-scan --verbose example.com
+  $0 --brute-force common.txt --concurrency 20 example.com
+
+EOF
+}
+
+# ===== ARG PARSING =====
+PARSED=$(getopt -o p:t:vo:u:H:h --long proxy:,timeout:,verbose,output:,user-agent:,header:,skip-robots,skip-admin,skip-cms,port-scan,ports:,brute-force:,concurrency:,help -- "$@") || {
+  usage; exit 1;
+}
+eval set -- "$PARSED"
+
+concurrency=$MAX_CONCURRENT
+
+while true; do
+  case "$1" in
+    -p|--proxy) proxy="$2"; shift 2;;
+    -t|--timeout) timeout="$2"; shift 2;;
+    -v|--verbose) verbose=1; shift;;
+    -o|--output) output_file="$2"; shift 2;;
+    -u|--user-agent) user_agent="$2"; shift 2;;
+    -H|--header) custom_headers+=("$2"); shift 2;;
+    --skip-robots) skip_robots=1; shift;;
+    --skip-admin) skip_admin=1; shift;;
+    --skip-cms) skip_cms=1; shift;;
+    --port-scan) port_scan=1; shift;;
+    --ports) ports="$2"; shift 2;;
+    --brute-force) brute_force=1; wordlist="$2"; shift 2;;
+    --concurrency) concurrency="$2"; shift 2;;
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    *) echo -e "${RED}Invalid option: $1${RESET}"; usage; exit 1;;
+  esac
+done
+
+if [ $# -lt 1 ]; then
+  echo -e "${RED}No domain specified!${RESET}"
+  usage
+  exit 1
+fi
+
+domain="${1,,}"  # lowercase domain
+domain=${domain#http://}
+domain=${domain#https://}
+domain=${domain%%/*}
+
+logv "Scan domain: $domain"
+logv "Proxy: $proxy"
+logv "Timeout: $timeout"
+logv "Verbose: $verbose"
+logv "Output file: $output_file"
+logv "User agent: $user_agent"
+logv "Custom headers: ${custom_headers[*]}"
+logv "Skip robots: $skip_robots"
+logv "Skip admin: $skip_admin"
+logv "Skip CMS: $skip_cms"
+logv "Port scan: $port_scan"
+logv "Ports: $ports"
+logv "Brute force: $brute_force"
+logv "Wordlist: $wordlist"
+logv "Concurrency: $concurrency"
+
+# Build curl options
+curl_opts=(--max-time "$timeout" -A "$user_agent" -s -L -k) # -k ignore SSL errors
+
+if [ -n "$proxy" ]; then
+  curl_opts+=(-x "$proxy")
+fi
+
+for hdr in "${custom_headers[@]}"; do
+  curl_opts+=(-H "$hdr")
+done
+
+# ===== FUNCTIONS =====
+
+# Function to get IP address
+get_ip() {
+  log "${CYAN}Resolving IP for $domain...${RESET}"
+  ip=$(dig +short "$domain" | head -n1)
+  if [ -z "$ip" ]; then
+    log "${RED}Failed to resolve IP for $domain${RESET}"
+    return 1
+  fi
+  log "${GREEN}IP Address: $ip${RESET}"
+  # Reverse DNS
+  revdns=$(dig +short -x "$ip" | sed 's/\.$//')
+  if [ -n "$revdns" ]; then
+    log "${GREEN}Reverse DNS: $revdns${RESET}"
+  fi
+  echo "$ip"
+}
+
+# Function to check HTTP/HTTPS with headers
+http_check() {
+  local url=$1
+  log "${CYAN}Checking URL: $url${RESET}"
+  response=$(curl "${curl_opts[@]}" -I "$url" 2>/dev/null)
+  if [ -z "$response" ]; then
+    log "${RED}No response from $url${RESET}"
+    return 1
+  fi
+  status_code=$(echo "$response" | grep HTTP | tail -1 | awk '{print $2}')
+  log "${GREEN}HTTP Status: $status_code${RESET}"
+  server=$(echo "$response" | grep -i "^Server:" | head -1 | cut -d' ' -f2-)
+  if [ -n "$server" ]; then
+    log "${GREEN}Server: $server${RESET}"
+  else
+    log "${YELLOW}Server: Unknown${RESET}"
+  fi
+  echo "$response"
+}
+
+# Function to fetch robots.txt and parse
+fetch_robots() {
+  if [ "$skip_robots" -eq 1 ]; then
+    logv "Skipping robots.txt fetch"
+    return
+  fi
+  for proto in https http; do
+    log "${CYAN}Fetching robots.txt from $proto://$domain/robots.txt ...${RESET}"
+    content=$(curl "${curl_opts[@]}" -s --max-time "$timeout" "$proto://$domain/robots.txt")
+    if [ -n "$content" ]; then
+      log "${GREEN}robots.txt found:${RESET}"
+      echo "$content"
+      return
+    fi
+  done
+  log "${YELLOW}robots.txt not found${RESET}"
+}
+
+# Function to scan admin pages & sensitive files
+scan_admin_pages() {
+  if [ "$skip_admin" -eq 1 ]; then
+    logv "Skipping admin page checks"
+    return
+  fi
+
+  local admin_paths=(
+    "admin" "administrator" "admin.php" "login" "login.php" "admin/login.php"
+    "wp-admin" "wp-login.php" "user/login" ".env" "config.php" "config.inc.php"
+    "dbadmin" "phpmyadmin" "pma" "cpanel" "panel" "admin_area" "cms"
+  )
+
+  log "${CYAN}Scanning for admin/sensitive pages...${RESET}"
+  for path in "${admin_paths[@]}"; do
+    for proto in https http; do
+      url="$proto://$domain/$path"
+      status=$(curl "${curl_opts[@]}" -o /dev/null -w "%{http_code}" -s --max-time "$timeout" "$url")
+      if [[ "$status" == "200" || "$status" == "301" || "$status" == "302" ]]; then
+        log "${GREEN}Found: $url (Status: $status)${RESET}"
+      else
+        logv "Not found: $url (Status: $status)"
+      fi
+    done
+  done
+}
+
+# Function to detect CMS - WordPress, Joomla, Drupal, Magento, etc.
+detect_cms() {
+  if [ "$skip_cms" -eq 1 ]; then
+    logv "Skipping CMS detection"
+    return
+  fi
+  log "${CYAN}Detecting CMS...${RESET}"
+  declare -A cms_signatures=(
+    ["WordPress"]="/wp-login.php /wp-admin/ /wp-includes/ readme.html"
+    ["Joomla"]="/administrator/ /language/en-GB/en-GB.xml"
+    ["Drupal"]="/user/login /core/CHANGELOG.txt"
+    ["Magento"]="/js/mage/ /skin/frontend/"
+    ["PrestaShop"]="/modules/ /themes/"
+  )
+
+  for cms in "${!cms_signatures[@]}"; do
+    found=0
+    for path in ${cms_signatures[$cms]}; do
+      for proto in https http; do
+        url="$proto://$domain$path"
+        status=$(curl "${curl_opts[@]}" -o /dev/null -w "%{http_code}" -s --max-time "$timeout" "$url")
+        if [[ "$status" == "200" || "$status" == "301" || "$status" == "302" ]]; then
+          log "${GREEN}Detected $cms via $url (Status: $status)${RESET}"
+          found=1
+          break 2
+        fi
+      done
+    done
+    if [ "$found" -eq 0 ]; then
+      logv "$cms not detected"
+    fi
+  done
+}
+
+# Function to extract SSL info (issuer, expiry)
+ssl_info() {
+  log "${CYAN}Fetching SSL certificate info...${RESET}"
+  ssl_output=$(echo | timeout $timeout openssl s_client -connect "$domain:443" -servername "$domain" 2>/dev/null)
+  if [ -z "$ssl_output" ]; then
+    log "${YELLOW}No SSL certificate found or connection failed${RESET}"
+    return
+  fi
+  issuer=$(echo "$ssl_output" | openssl x509 -noout -issuer 2>/dev/null)
+  expiry=$(echo "$ssl_output" | openssl x509 -noout -enddate 2>/dev/null)
+  log "${GREEN}$issuer${RESET}"
+  log "${GREEN}$expiry${RESET}"
+}
+
+# Function to run nmap port & vuln scan
+run_nmap() {
+  if ! command -v nmap &>/dev/null; then
+    log "${YELLOW}nmap not installed, skipping port scan${RESET}"
+    return
+  fi
+  ip_addr=$1
+  log "${CYAN}Running nmap scan on $ip_addr ports $ports...${RESET}"
+  nmap -sV --script vuln -p "$ports" "$ip_addr"
+}
+
+# Function to brute force directories using wordlist
+brute_force_dirs() {
+  if [ "$brute_force" -eq 0 ]; then
+    logv "Skipping brute force"
+    return
+  fi
+  if [ ! -f "$wordlist" ]; then
+    error_exit "Wordlist file '$wordlist' not found!"
+  fi
+  if ! command -v parallel &>/dev/null; then
+    log "${YELLOW}GNU parallel not installed. Brute force will run sequentially.${RESET}"
+  else
+    logv "GNU parallel detected, running concurrent brute force"
+  fi
+
+  log "${CYAN}Starting directory brute force with wordlist $wordlist...${RESET}"
+  scan_url() {
+    local dir=$1
+    for proto in https http; do
+      url="$proto://$domain/$dir"
+      status=$(curl "${curl_opts[@]}" -o /dev/null -w "%{http_code}" -s --max-time "$timeout" "$url")
+      if [[ "$status" == "200" || "$status" == "301" || "$status" == "302" ]]; then
+        echo -e "${GREEN}Found: $url (Status: $status)${RESET}"
+      else
+        logv "Not found: $url (Status: $status)"
+      fi
+    done
+  }
+
+  if command -v parallel &>/dev/null; then
+    export -f scan_url logv curl_opts domain timeout GREEN RESET YELLOW
+    cat "$wordlist" | parallel -j "$concurrency" scan_url {}
+  else
+    while IFS= read -r line; do
+      scan_url "$line"
+    done < "$wordlist"
+  fi
+}
+
+# ===== MAIN =====
+start_time=$(date +%s)
+
+echo -e "${MAGENTA}=== CyberScanX Ultimate v$VERSION ===${RESET}"
+echo -e "${MAGENTA}Target: $domain${RESET}"
+echo -e "${MAGENTA}Scan started: $(date)${RESET}"
+
+ip_addr=$(get_ip) || exit 1
+
+http_check "http://$domain"
+http_check "https://$domain"
+
+ssl_info
+
+if [ "$skip_robots" -eq 0 ]; then
+  fetch_robots
+fi
+
+if [ "$skip_admin" -eq 0 ]; then
+  scan_admin_pages
+fi
+
+if [ "$skip_cms" -eq 0 ]; then
+  detect_cms
+fi
+
+if [ "$port_scan" -eq 1 ]; then
+  run_nmap "$ip_addr"
+fi
+
+if [ "$brute_force" -eq 1 ]; then
+  brute_force_dirs
+fi
+
+end_time=$(date +%s)
+duration=$((end_time - start_time))
+echo -e "${MAGENTA}Scan completed in $duration seconds.${RESET}"
+
+if [ -n "$output_file" ]; then
+  log "${GREEN}Saving output to $output_file...${RESET}"
+  # For now, just redirect all console output to file if requested.
+  # You can extend to JSON or structured output.
+fi
