@@ -45,6 +45,7 @@ CyberScanX is a powerful and flexible desingned for pentesters...
 ```bash
 apt-get update && apt upgrade -y
 apt-get install git -y
+apt-get install figlet -y
 git clone https://github.com/midotech1/cyberscanx.git
 cd cyberscanx
 chmod +x *
